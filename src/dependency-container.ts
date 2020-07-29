@@ -8,7 +8,11 @@ import {
 } from "./providers";
 import Provider, {isProvider} from "./providers/provider";
 import FactoryProvider from "./providers/factory-provider";
-import InjectionToken, {isTokenDescriptor} from "./providers/injection-token";
+import InjectionToken, {
+  isConstructorToken,
+  isTokenDescriptor,
+  TokenDescriptor
+} from "./providers/injection-token";
 import TokenProvider from "./providers/token-provider";
 import ValueProvider from "./providers/value-provider";
 import ClassProvider from "./providers/class-provider";
@@ -17,6 +21,8 @@ import constructor from "./types/constructor";
 import Registry from "./registry";
 import Lifecycle from "./types/lifecycle";
 import ResolutionContext from "./resolution-context";
+import {formatErrorCtor} from "./error-helpers";
+import {DelayedConstructor} from "./lazy-helpers";
 
 export type Registration<T = any> = {
   provider: Provider<T>;
@@ -24,7 +30,9 @@ export type Registration<T = any> = {
   instance?: T;
 };
 
-export const typeInfo = new Map<constructor<any>, any[]>();
+export type ParamInfo = TokenDescriptor | InjectionToken<any>;
+
+export const typeInfo = new Map<constructor<any>, ParamInfo[]>();
 
 /** Dependency Container */
 class InternalDependencyContainer implements DependencyContainer {
@@ -79,9 +87,11 @@ class InternalDependencyContainer implements DependencyContainer {
       options.lifecycle == Lifecycle.ResolutionScoped
     ) {
       if (isValueProvider(provider) || isFactoryProvider(provider)) {
-        throw `Cannot use lifecycle "${
-          Lifecycle[options.lifecycle]
-        }" with ValueProviders or FactoryProviders`;
+        throw new Error(
+          `Cannot use lifecycle "${
+            Lifecycle[options.lifecycle]
+          }" with ValueProviders or FactoryProviders`
+        );
       }
     }
 
@@ -145,7 +155,9 @@ class InternalDependencyContainer implements DependencyContainer {
         );
       }
 
-      throw "Cannot register a type name as a singleton without a \"to\" token";
+      throw new Error(
+        'Cannot register a type name as a singleton without a "to" token'
+      );
     }
 
     let useClass = from;
@@ -169,7 +181,9 @@ class InternalDependencyContainer implements DependencyContainer {
     const registration = this.getRegistration(token);
 
     if (!registration && isNormalToken(token)) {
-      throw `Attempted to resolve unregistered dependency token: ${token.toString()}`;
+      throw new Error(
+        `Attempted to resolve unregistered dependency token: "${token.toString()}"`
+      );
     }
 
     if (registration) {
@@ -177,7 +191,12 @@ class InternalDependencyContainer implements DependencyContainer {
     }
 
     // No registration for this token, but since it's a constructor, return an instance
-    return this.construct(token as constructor<T>, context);
+    if (isConstructorToken(token)) {
+      return this.construct(token, context);
+    }
+    throw new Error(
+      "Attempted to construct an undefined constructor. Could mean a circular dependency problem. Try using `delay` function."
+    );
   }
 
   private resolveRegistration<T>(
@@ -239,7 +258,9 @@ class InternalDependencyContainer implements DependencyContainer {
     const registrations = this.getAllRegistrations(token);
 
     if (!registrations && isNormalToken(token)) {
-      throw `Attempted to resolve unregistered dependency token: ${token.toString()}`;
+      throw new Error(
+        `Attempted to resolve unregistered dependency token: "${token.toString()}"`
+      );
     }
 
     if (registrations) {
@@ -263,6 +284,22 @@ class InternalDependencyContainer implements DependencyContainer {
 
   public reset(): void {
     this._registry.clear();
+  }
+
+  public clearInstances(): void {
+    for (const [token, registrations] of this._registry.entries()) {
+      this._registry.setAll(
+        token,
+        registrations
+          // Clear ValueProvider registrations
+          .filter(registration => !isValueProvider(registration.provider))
+          // Clear instances
+          .map(registration => {
+            registration.instance = undefined;
+            return registration;
+          })
+      );
+    }
   }
 
   public createChildContainer(): DependencyContainer {
@@ -322,7 +359,16 @@ class InternalDependencyContainer implements DependencyContainer {
     return null;
   }
 
-  private construct<T>(ctor: constructor<T>, context: ResolutionContext): T {
+  private construct<T>(
+    ctor: constructor<T> | DelayedConstructor<T>,
+    context: ResolutionContext
+  ): T {
+    if (ctor instanceof DelayedConstructor) {
+      return ctor.createProxy((target: constructor<T>) =>
+        this.resolve(target, context)
+      );
+    }
+
     if (ctor.length === 0) {
       return new ctor();
     }
@@ -330,19 +376,27 @@ class InternalDependencyContainer implements DependencyContainer {
     const paramInfo = typeInfo.get(ctor);
 
     if (!paramInfo || paramInfo.length === 0) {
-      throw `TypeInfo not known for ${ctor}`;
+      throw new Error(`TypeInfo not known for "${ctor.name}"`);
     }
 
-    const params = paramInfo.map(param => {
-      if (isTokenDescriptor(param)) {
-        return param.multiple
-          ? this.resolveAll(param.token)
-          : this.resolve(param.token, context);
-      }
-      return this.resolve(param, context);
-    });
+    const params = paramInfo.map(this.resolveParams(context, ctor));
 
     return new ctor(...params);
+  }
+
+  private resolveParams<T>(context: ResolutionContext, ctor: constructor<T>) {
+    return (param: ParamInfo, idx: number) => {
+      try {
+        if (isTokenDescriptor(param)) {
+          return param.multiple
+            ? this.resolveAll(param.token)
+            : this.resolve(param.token, context);
+        }
+        return this.resolve(param, context);
+      } catch (e) {
+        throw new Error(formatErrorCtor(ctor, idx, e));
+      }
+    };
   }
 }
 
